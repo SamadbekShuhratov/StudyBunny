@@ -10,10 +10,9 @@ from typing import Any
 from urllib.parse import quote
 
 import streamlit as st
-from anthropic import Anthropic
+import litellm
 from icalendar import Calendar, Event
 
-MODEL_NAME = "claude-sonnet-5-5"
 DEFAULT_LANGUAGE = "Uzbek"
 
 
@@ -215,8 +214,7 @@ def web_search(query: str) -> ToolResult:
     return ToolResult(
         True,
         (
-            "Web search requested. If available, the model should use Anthropic server-side web search "
-            f"with this query: {query}"
+            f"Web search requested with query: {query}"
         ),
     )
 
@@ -303,11 +301,6 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "required": ["query"],
             },
         },
-        {
-            "type": "web_search_20250305",
-            "name": "anthropic_web_search",
-            "max_uses": 5,
-        },
     ]
 
 
@@ -363,16 +356,21 @@ Rules:
 """.strip()
 
 
-def _text_from_content(blocks: list[Any]) -> str:
-    lines = []
-    for block in blocks:
-        if getattr(block, "type", None) == "text":
-            lines.append(getattr(block, "text", ""))
-    return "\n".join(part for part in lines if part).strip()
+def run_agent(user_input: str, api_key: str, model_name: str, language: str) -> tuple[str, list[dict[str, Any]]]:
+    # LiteLLM yordamida universal kalit va modelni o'rnatish
+    import os
+    if "claude" in model_name.lower():
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+    elif "gpt" in model_name.lower() or "o1" in model_name.lower() or "o3" in model_name.lower():
+        os.environ["OPENAI_API_KEY"] = api_key
+    elif "gemini" in model_name.lower():
+        os.environ["GEMINI_API_KEY"] = api_key
+    else:
+        # Standart holatda universal tarzda uzatamiz
+        os.environ["GEMINI_API_KEY"] = api_key
+        os.environ["OPENAI_API_KEY"] = api_key
+        os.environ["ANTHROPIC_API_KEY"] = api_key
 
-
-def run_agent(user_input: str, api_key: str, language: str) -> tuple[str, list[dict[str, Any]]]:
-    client = Anthropic(api_key=api_key)
     messages = [
         {"role": msg.get("role", "assistant"), "content": msg.get("content", "")}
         for msg in st.session_state.chat_messages
@@ -380,33 +378,40 @@ def run_agent(user_input: str, api_key: str, language: str) -> tuple[str, list[d
     messages.append({"role": "user", "content": user_input})
     action_log: list[dict[str, Any]] = []
 
+    formatted_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"]
+            }
+        }
+        for t in tool_schemas() if t.get("name")
+    ]
+
     for iteration in range(10):
-        response = client.messages.create(
-            model=MODEL_NAME,
+        response = litellm.completion(
+            model=model_name,
             max_tokens=1200,
-            system=build_system_prompt(language),
-            tools=tool_schemas(),
-            messages=messages,
+            messages=[{"role": "system", "content": build_system_prompt(language)}] + messages,
+            tools=formatted_tools,
         )
 
-        assistant_content = response.content
-        messages.append({"role": "assistant", "content": assistant_content})
+        assistant_message = response.choices[0].message
+        assistant_content = assistant_message.content or ""
+        tool_calls = getattr(assistant_message, "tool_calls", None)
 
-        if response.stop_reason == "pause_turn":
-            action_log.append(
-                {
-                    "iteration": iteration + 1,
-                    "type": "pause_turn",
-                    "note": "Model paused for server-side tool execution; continuing.",
-                }
-            )
-            continue
+        messages.append({"role": "assistant", "content": assistant_content, "tool_calls": tool_calls})
 
-        tool_uses = [block for block in assistant_content if getattr(block, "type", "") == "tool_use"]
-        if tool_uses:
-            for block in tool_uses:
-                tool_name = getattr(block, "name", "")
-                tool_input = getattr(block, "input", {})
+        if tool_calls:
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    tool_input = json.loads(tool_call.function.arguments)
+                except Exception:
+                    tool_input = {}
+                
                 result = execute_tool(tool_name, tool_input)
                 action_log.append(
                     {
@@ -420,21 +425,14 @@ def run_agent(user_input: str, api_key: str, language: str) -> tuple[str, list[d
                 )
                 messages.append(
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": getattr(block, "id"),
-                                "content": result.content,
-                                "is_error": not result.ok,
-                            }
-                        ],
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result.content,
                     }
                 )
             continue
 
-        final_text = _text_from_content(assistant_content)
-        return final_text or "No response generated.", action_log
+        return assistant_content or "No response generated.", action_log
 
     fallback = "Reached iteration limit. Please rephrase or try a smaller request."
     return fallback, action_log
@@ -550,7 +548,8 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Settings")
-        api_key = st.text_input("Anthropic API key", type="password", help="Your key is stored only in this session.")
+        api_key = st.text_input("AI API Key", type="password", help="Enter your API key (Anthropic, OpenAI, Gemini, etc.)")
+        model_name = st.text_input("Model Name", value="claude-3-5-sonnet-20241022", help="LiteLLM format model name (e.g., gpt-4o, claude-3-5-sonnet-20241022, gemini/gemini-1.5-pro)")
         language = st.selectbox("Interface language", ["Uzbek", "English", "Russian"], index=0)
 
         st.markdown("### Student profile")
@@ -579,16 +578,19 @@ def main() -> None:
                 st.error("Please provide your API key first.")
             else:
                 summary_prompt = "Give me a full daily briefing for the next 7 days based on my schedule and tasks."
-                with st.spinner("Generating daily briefing..."):
-                    answer, actions = run_agent(summary_prompt, api_key, language)
-                st.session_state.action_logs.append(actions)
-                st.session_state.chat_messages.extend(
-                    [
-                        {"role": "user", "content": summary_prompt},
-                        {"role": "assistant", "content": answer},
-                    ]
-                )
-                st.success("Briefing ready in Chat tab.")
+                try:
+                    with st.spinner("Generating daily briefing..."):
+                        answer, actions = run_agent(summary_prompt, api_key, model_name, language)
+                    st.session_state.action_logs.append(actions)
+                    st.session_state.chat_messages.extend(
+                        [
+                            {"role": "user", "content": summary_prompt},
+                            {"role": "assistant", "content": answer},
+                        ]
+                    )
+                    st.success("Briefing ready in Chat tab.")
+                except Exception as e:
+                    st.error(f"❌ Xatolik yuz berdi: {e}")
 
     tab_chat, tab_dashboard = st.tabs(["Chat", "Dashboard"])
 
@@ -599,24 +601,29 @@ def main() -> None:
             if role == "user":
                 st.chat_message("user").write(msg.get("content", ""))
             else:
-                st.chat_message("assistant").write(msg.get("content", ""))
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    st.chat_message("assistant").write(content)
 
         prompt = st.chat_input("Write your request (Uzbek is supported)")
         if prompt:
             if not api_key:
-                st.error("Please enter your Anthropic API key in the sidebar.")
+                st.error("Please enter your API key in the sidebar.")
             else:
                 st.chat_message("user").write(prompt)
-                with st.spinner("Thinking..."):
-                    answer, actions = run_agent(prompt, api_key, language)
-                st.chat_message("assistant").write(answer)
-                st.session_state.action_logs.append(actions)
-                st.session_state.chat_messages.extend(
-                    [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": answer},
-                    ]
-                )
+                try:
+                    with st.spinner("Thinking..."):
+                        answer, actions = run_agent(prompt, api_key, model_name, language)
+                    st.chat_message("assistant").write(answer)
+                    st.session_state.action_logs.append(actions)
+                    st.session_state.chat_messages.extend(
+                        [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": answer},
+                        ]
+                    )
+                except Exception as e:
+                    st.error(f"❌ Xatolik yuz berdi: {e}")
 
         with st.expander("Agent actions log", expanded=False):
             if not st.session_state.action_logs:
